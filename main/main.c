@@ -31,14 +31,19 @@ does use more RAM though.
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
 
 #include "lwip/api.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
 
+#include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_event_loop.h"
 #include "nvs_flash.h"
-#include "driver/ledc.h"
 
 #include "string.h"
 
@@ -46,132 +51,74 @@ does use more RAM though.
 
 #include "ADC.h"
 
-#define LED_PIN CONFIG_LED_PIN
-#define AP_SSID CONFIG_AP_SSID
-#define AP_PSSWD CONFIG_AP_PSSWD
+#define EXAMPLE_ESP_WIFI_SSID      "cmuc"
+#define EXAMPLE_ESP_WIFI_PASS      "trlababalan"
+#define EXAMPLE_ESP_MAXIMUM_RETRY  10
 
 static QueueHandle_t client_queue;
 const static int client_queue_size = 10;
 
-static ledc_channel_config_t ledc_channel;
+/* FreeRTOS event group to signal when we are connected*/
+static EventGroupHandle_t s_wifi_event_group;
 
-// handles WiFi events
-static esp_err_t event_handler(void* ctx, system_event_t* event) {
-  const char* TAG = "event_handler";
-  switch(event->event_id) {
-    case SYSTEM_EVENT_AP_START:
-      //ESP_ERROR_CHECK(tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, "esp32"));
-      ESP_LOGI(TAG,"Access Point Started");
-      break;
-    case SYSTEM_EVENT_AP_STOP:
-      ESP_LOGI(TAG,"Access Point Stopped");
-      break;
-    case SYSTEM_EVENT_AP_STACONNECTED:
-      ESP_LOGI(TAG,"STA Connected, MAC=%02x:%02x:%02x:%02x:%02x:%02x AID=%i",
-        event->event_info.sta_connected.mac[0],event->event_info.sta_connected.mac[1],
-        event->event_info.sta_connected.mac[2],event->event_info.sta_connected.mac[3],
-        event->event_info.sta_connected.mac[4],event->event_info.sta_connected.mac[5],
-        event->event_info.sta_connected.aid);
-      break;
-    case SYSTEM_EVENT_AP_STADISCONNECTED:
-      ESP_LOGI(TAG,"STA Disconnected, MAC=%02x:%02x:%02x:%02x:%02x:%02x AID=%i",
-        event->event_info.sta_disconnected.mac[0],event->event_info.sta_disconnected.mac[1],
-        event->event_info.sta_disconnected.mac[2],event->event_info.sta_disconnected.mac[3],
-        event->event_info.sta_disconnected.mac[4],event->event_info.sta_disconnected.mac[5],
-        event->event_info.sta_disconnected.aid);
-      break;
-    case SYSTEM_EVENT_AP_PROBEREQRECVED:
-      ESP_LOGI(TAG,"AP Probe Received");
-      break;
-    case SYSTEM_EVENT_AP_STA_GOT_IP6:
-      ESP_LOGI(TAG,"Got IP6=%01x:%01x:%01x:%01x",
-        event->event_info.got_ip6.ip6_info.ip.addr[0],event->event_info.got_ip6.ip6_info.ip.addr[1],
-        event->event_info.got_ip6.ip6_info.ip.addr[2],event->event_info.got_ip6.ip6_info.ip.addr[3]);
-      break;
-    default:
-      ESP_LOGI(TAG,"Unregistered event=%i",event->event_id);
-      break;
-  }
-  return ESP_OK;
-}
+/* The event group allows multiple bits for each event, but we only care about one event 
+ * - are we connected to the AP with an IP? */
+const int WIFI_CONNECTED_BIT = BIT0;
 
-// sets up WiFi
-static void wifi_setup() {
-  const char* TAG = "wifi_setup";
+static const char *TAG = "wifi station";
 
-  ESP_LOGI(TAG,"starting tcpip adapter");
-  tcpip_adapter_init();
-  nvs_flash_init();
-  ESP_ERROR_CHECK(tcpip_adapter_dhcps_stop(TCPIP_ADAPTER_IF_AP));
-  //tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_AP,"esp32");
-  tcpip_adapter_ip_info_t info;
-  memset(&info, 0, sizeof(info));
-  IP4_ADDR(&info.ip, 192, 168, 4, 1);
-  IP4_ADDR(&info.gw, 192, 168, 4, 1);
-  IP4_ADDR(&info.netmask, 255, 255, 255, 0);
-  ESP_LOGI(TAG,"setting gateway IP");
-  ESP_ERROR_CHECK(tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_AP, &info));
-  //ESP_ERROR_CHECK(tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_AP,"esp32"));
-  //ESP_LOGI(TAG,"set hostname to \"%s\"",hostname);
-  ESP_LOGI(TAG,"starting DHCPS adapter");
-  ESP_ERROR_CHECK(tcpip_adapter_dhcps_start(TCPIP_ADAPTER_IF_AP));
-  //ESP_ERROR_CHECK(tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_AP,hostname));
-  ESP_LOGI(TAG,"starting event loop");
-  ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
+static int s_retry_num = 0;
 
-  ESP_LOGI(TAG,"initializing WiFi");
-  wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
-  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+static void event_handler(void* arg, esp_event_base_t event_base, 
+                                int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
+            esp_wifi_connect();
 
-  wifi_config_t wifi_config = {
-    .ap = {
-      .ssid = AP_SSID,
-      .password= AP_PSSWD,
-      .channel = 0,
-      .authmode = WIFI_AUTH_WPA2_PSK,
-      .ssid_hidden = 0,
-      .max_connection = 4,
-      .beacon_interval = 100
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            s_retry_num++;
+            ESP_LOGI(TAG, "retry to connect to the AP");
+        }
+        ESP_LOGI(TAG,"connect to the AP fail");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
-  };
-
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
-  ESP_LOGI(TAG,"WiFi set up");
 }
 
-// sets up the led for pwm
-static void led_duty(uint16_t duty) {
-  static uint16_t val;
-  static uint16_t max = (1L<<10)-1;
-  if(duty > 100) return;
-  val = (duty * max) / 100;
-  ledc_set_duty(ledc_channel.speed_mode,ledc_channel.channel,val);
-  ledc_update_duty(ledc_channel.speed_mode,ledc_channel.channel);
-}
+void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
 
-static void led_setup() {
-  const static char* TAG = "led_setup";
+    ESP_ERROR_CHECK(esp_netif_init());
 
-  ledc_timer_config_t ledc_timer = {
-    .duty_resolution = LEDC_TIMER_10_BIT,
-    .freq_hz         = 5000,
-    .speed_mode      = LEDC_HIGH_SPEED_MODE,
-    .timer_num       = LEDC_TIMER_0
-  };
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
 
-  ledc_channel.channel = LEDC_CHANNEL_0;
-  ledc_channel.duty = 0;
-  ledc_channel.gpio_num = LED_PIN,
-  ledc_channel.speed_mode = LEDC_HIGH_SPEED_MODE;
-  ledc_channel.timer_sel = LEDC_TIMER_0;
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-  ledc_timer_config(&ledc_timer);
-  ledc_channel_config(&ledc_channel);
-  led_duty(0);
-  ESP_LOGI(TAG,"led is off and ready, 10 bits");
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .password = EXAMPLE_ESP_WIFI_PASS
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_start() );
+    ESP_LOGI(TAG, "wifi_init_sta finished.");
+    ESP_LOGI(TAG, "connect to ap SSID:%s password:%s",
+             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
 }
 
 // handles websocket events
@@ -185,14 +132,12 @@ void websocket_callback(uint8_t num,WEBSOCKET_TYPE_t type,char* msg,uint64_t len
       break;
     case WEBSOCKET_DISCONNECT_EXTERNAL:
       ESP_LOGI(TAG,"client %i sent a disconnect message",num);
-      led_duty(0);
       break;
     case WEBSOCKET_DISCONNECT_INTERNAL:
       ESP_LOGI(TAG,"client %i was disconnected",num);
       break;
     case WEBSOCKET_DISCONNECT_ERROR:
       ESP_LOGI(TAG,"client %i was disconnected due to an error",num);
-      led_duty(0);
       break;
     case WEBSOCKET_TEXT:
       if(len) { // if the message length was greater than zero
@@ -200,7 +145,6 @@ void websocket_callback(uint8_t num,WEBSOCKET_TYPE_t type,char* msg,uint64_t len
           case 'L':
             if(sscanf(msg,"L%i",&value)) {
               ESP_LOGI(TAG,"LED value: %i",value);
-              led_duty(value);
               ws_server_send_text_all_from_callback(msg,len); // broadcast it!
             }
             break;
@@ -390,34 +334,13 @@ static void server_handle_task(void* pvParameters) {
 }
 
 static void count_task(void* pvParameters) {
-/*
-  const static char* TAG = "count_task";
-  char out[20];
-  int len;
-  int clients;
-  const static char* word = "%i";
-  uint8_t n = 0;
-  const int DELAY = 1000 / portTICK_PERIOD_MS; // 1 second
-
-  ESP_LOGI(TAG,"starting task");
-  for(;;) {
-    len = sprintf(out,word,n);
-    clients = ws_server_send_text_all(out,len);
-    if(clients > 0) {
-      //ESP_LOGI(TAG,"sent: \"%s\" to %i clients",out,clients);
-    }
-    n++;
-    vTaskDelay(DELAY);
-  }
-*/
     uint32_t voltage;
-    const int DELAY = 25 / portTICK_PERIOD_MS; // 1 second
+    const int DELAY = 100 / portTICK_PERIOD_MS; // 1 second
     int len;
     char out[32];
     int clients;
 
     ADC_Init();
-
 
     while(1)
     {
@@ -425,7 +348,7 @@ static void count_task(void* pvParameters) {
         len = sprintf(out,"%dV\n",voltage);
         clients = ws_server_send_text_all(out,len);
         if(clients > 0) {
-          //ESP_LOGI(TAG,"sent: \"%s\" to %i clients",out,clients);
+          ESP_LOGI(TAG,"sent: \"%s\" to %i clients",out,clients);
         }
         vTaskDelay(DELAY);
     }
@@ -433,8 +356,16 @@ static void count_task(void* pvParameters) {
 }
 
 void app_main() {
-  wifi_setup();
-  led_setup();
+    //Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+
+  wifi_init_sta();
   ws_server_start();
   xTaskCreate(&server_task,"server_task",3000,NULL,9,NULL);
   xTaskCreate(&server_handle_task,"server_handle_task",4000,NULL,6,NULL);

@@ -113,7 +113,7 @@ CONFIG_ESPTOOLPY_MONITOR_BAUD=115200
 # Example Options
 #
 CONFIG_LED_PIN=2
-CONFIG_AP_SSID="cmuc"
+CONFIG_AP_SSID="ESP32_AP"
 CONFIG_AP_PSSWD="trlababalan"
 # end of Example Options
 
@@ -300,6 +300,18 @@ CONFIG_ESP32_DPORT_DIS_INTERRUPT_LVL=5
 #
 # CONFIG_PM_ENABLE is not set
 # end of Power Management
+
+#
+# Camera configuration
+#
+CONFIG_OV2640_SUPPORT=y
+# CONFIG_OV7725_SUPPORT is not set
+CONFIG_OV3660_SUPPORT=y
+CONFIG_SCCB_HARDWARE_I2C=y
+CONFIG_CAMERA_CORE0=y
+# CONFIG_CAMERA_CORE1 is not set
+# CONFIG_CAMERA_NO_AFFINITY is not set
+# end of Camera configuration
 
 #
 # Cache config
